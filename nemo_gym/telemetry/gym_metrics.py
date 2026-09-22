@@ -48,6 +48,16 @@ Bounded attributes identify the binding connector limit, queue outcome, and dest
 ``gym.http.connection_pool.connect_total`` (observable counter): all connection attempts
 (``connect()`` calls), including attempts that later fail or are abandoned.
 Compare its value with the queue-duration histogram count to calculate the queued fraction.
+
+Rollout outcomes
+----------------
+``gym.rollout.completed_total`` (counter): one per rollout *attempt*, recorded after the driver
+wrote it. ``nemo.gym.rollout.outcome`` is ``scored`` (main output, masked results included),
+``dropped`` (failures sidecar) or ``omitted`` (no-persist, e.g. kill-shaped; rows drained by the
+dispatch budget never ran and are not counted). A failed attempt and its successful retry count
+one each; coverage comes from the output files. Failure attributes are bounded:
+``nemo.gym.failure_class``, the registered ``nemo.gym.failure_kind`` and ``nemo.gym.failure_type``
+(exception class name). Free-text reasons are never attributes.
 """
 
 import logging
@@ -282,3 +292,30 @@ def _reset_for_testing() -> None:
     """Drop cached instruments. Test-only."""
     with _INSTRUMENT_LOCK:
         _INSTRUMENTS.clear()
+
+
+ROLLOUT_COMPLETED_INSTRUMENT = "gym.rollout.completed_total"
+ROLLOUT_OUTCOME_ATTRIBUTE = "nemo.gym.rollout.outcome"
+FAILURE_CLASS_ATTRIBUTE = "nemo.gym.failure_class"
+FAILURE_KIND_ATTRIBUTE = "nemo.gym.failure_kind"
+FAILURE_TYPE_ATTRIBUTE = "nemo.gym.failure_type"
+
+
+def record_rollout_completed(
+    outcome: str,
+    *,
+    failure_class: str | None = None,
+    failure_kind: str | None = None,
+    failure_type: str | None = None,
+) -> None:
+    """Count one finished rollout attempt in ``gym.rollout.completed_total``."""
+    attributes: dict[str, Any] = {ROLLOUT_OUTCOME_ATTRIBUTE: outcome}
+    if failure_class:
+        attributes[FAILURE_CLASS_ATTRIBUTE] = failure_class
+    if failure_kind:
+        attributes[FAILURE_KIND_ATTRIBUTE] = failure_kind
+    if failure_type:
+        attributes[FAILURE_TYPE_ATTRIBUTE] = failure_type
+    _record_counter(
+        ROLLOUT_COMPLETED_INSTRUMENT, "Rollout attempts the driver finished handling, by outcome.", attributes
+    )

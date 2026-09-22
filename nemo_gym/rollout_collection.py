@@ -59,7 +59,7 @@ from nemo_gym.config_types import (
 )
 from nemo_gym.deliverables import is_deliverable
 from nemo_gym.exporters import export_metrics, export_rollouts, get_exporters
-from nemo_gym.failure_kinds import CANCELLED
+from nemo_gym.failure_kinds import CANCELLED, validate_failure_kind
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     AGENT_SERVER_TYPE_KEY_NAME,
@@ -98,6 +98,7 @@ from nemo_gym.rollout_observability import (
     TrajectoryTurn,
 )
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, managed_span
+from nemo_gym.telemetry.gym_metrics import record_rollout_completed
 from nemo_gym.telemetry.span_groups import GymSpanGroup
 
 
@@ -1683,6 +1684,20 @@ _SERVER_DID_NOT_RUN_STATUSES = frozenset({429, 502, 503, 504})
 _MAX_FAILURE_BODY_CHARS = 2000
 
 
+def _record_rollout_outcome(result: Dict[str, Any], outcome: str) -> None:
+    """One ``gym.rollout.completed_total`` increment, after the driver wrote or omitted the attempt."""
+    if not is_span_group_enabled(GymSpanGroup.ROLLOUT):
+        return
+    failure_kind = result.get("failure_kind")
+    failure_type = result.get("_ng_failure_type")
+    record_rollout_completed(
+        outcome,
+        failure_class=result.get(NG_FAILURE_CLASS_KEY),
+        failure_kind=validate_failure_kind(failure_kind) if isinstance(failure_kind, str) else None,
+        failure_type=failure_type if isinstance(failure_type, str) else None,
+    )
+
+
 def _agent_request_failure_row(exc: BaseException, status: Optional[int]) -> Dict[str, Any]:
     """One sidecar row for a `/run` call that came back without a result.
 
@@ -2869,7 +2884,9 @@ class RolloutCollectionHelper(BaseModel):
                     # kill_shaped, or drained by the dispatch budget: written to neither
                     # the jsonl nor the sidecar. Set-difference on resume naturally
                     # re-dispatches; per-task timeout bounds wallclock.
-                    pass
+                    if not result.get(NG_DISPATCH_DRAINED_KEY):
+                        # A drained row never ran, so it is not an attempt.
+                        _record_rollout_outcome(result, "omitted")
                 elif failure_class is not None:
                     # Non-kill_shaped failure → sidecar. The aggregator only reads
                     # the main jsonl, so this keeps win-rate uncontaminated.
@@ -2884,12 +2901,14 @@ class RolloutCollectionHelper(BaseModel):
                     )
                     failures_file.write(serialized + b"\n")
                     failures_file.flush()
+                    _record_rollout_outcome(result, "dropped")
                     if batch_tracker is not None:
                         batch_failure_rows.append(_batch_status_row(result, batch_agent_refs))
                 else:
                     # Success → main jsonl.
                     results_file.write(serialized + b"\n")
                     results_file.flush()
+                    _record_rollout_outcome(result, "scored")
                     persisted_count += 1
                     persisted_success_keys.add((result[TASK_INDEX_KEY_NAME], result[ROLLOUT_INDEX_KEY_NAME]))
                     if config.retain_results_in_memory:
