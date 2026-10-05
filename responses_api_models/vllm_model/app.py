@@ -995,8 +995,11 @@ class VLLMModel(SimpleResponsesAPIModel):
                     # Record the refusal before it leaves the server: the refused call
                     # generated nothing, so it leaves no capture record, and this is what
                     # tells a consumer the rollout ended here rather than at the harness's
-                    # own stopping point.
-                    await record_refusal(CONTEXT_LENGTH_EXCEEDED)
+                    # own stopping point. Only a body that names the context length is
+                    # the window refusal; a 400 that mentions max_tokens alone is a
+                    # request-parameter error and is not a refusal of the rollout.
+                    if "context length" in result_content_str:
+                        await record_refusal(CONTEXT_LENGTH_EXCEEDED)
                     setattr(e, _PROPAGATE_CONTEXT_ERROR_ATTRIBUTE, True)
                     raise
                 res = self._create_empty_chat_completion()
@@ -1335,8 +1338,11 @@ class VLLMModel(SimpleResponsesAPIModel):
                     # Record the refusal before it leaves the server: the refused call
                     # generated nothing, so it leaves no capture record, and this is what
                     # tells a consumer the rollout ended here rather than at the harness's
-                    # own stopping point.
-                    await record_refusal(CONTEXT_LENGTH_EXCEEDED)
+                    # own stopping point. Only a body that names the context length is
+                    # the window refusal; a 400 that mentions max_tokens alone is a
+                    # request-parameter error and is not a refusal of the rollout.
+                    if "context length" in result_content_str:
+                        await record_refusal(CONTEXT_LENGTH_EXCEEDED)
                     setattr(e, _PROPAGATE_CONTEXT_ERROR_ATTRIBUTE, True)
                     raise
                 res = self._create_empty_chat_completion()

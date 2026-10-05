@@ -884,6 +884,32 @@ class TestApp:
         # The call never ran, so nothing was lost.
         assert not store.is_incomplete("r0")
 
+    def test_a_max_tokens_only_400_records_no_refusal(self, monkeypatch: MonkeyPatch, tmp_path) -> None:
+        # A 400 whose body names only max_tokens is a request-parameter error the caller can
+        # correct, not the engine refusing the rollout at its context window.
+        store = TokenCaptureStore(tmp_path)
+        server = self._setup_server(monkeypatch, propagate_context_overflow_errors=True)
+        request_info = MagicMock(real_url="http://vllm.test/v1/chat/completions")
+        error = ClientResponseError(request_info, (), status=400, message="Bad Request")
+        error.response_content = b'{"error":{"message":"max_tokens must be at least 1","code":400}}'
+        mock_client = MagicMock(spec=NeMoGymAsyncOpenAI)
+        mock_client.create_chat_completion = AsyncMock(side_effect=error)
+        server._clients = [mock_client]
+
+        app = server.setup_webserver()
+        server.setup_exception_middleware(app)
+        token = set_token_sink(CaptureContext(rollout_id="r0", model_call_id="mc-1", token_sink=store))
+        try:
+            response = TestClient(app).post(
+                "/v1/chat/completions",
+                json={"model": "dummy_model", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        finally:
+            reset_token_sink(token)
+
+        assert response.status_code == 400
+        assert store.read_refusals("r0") == []
+
     def test_the_absorbed_overflow_records_no_refusal(self, monkeypatch: MonkeyPatch, tmp_path) -> None:
         # Without propagate_context_overflow_errors the caller sees an exhausted generation, so
         # the rollout did not end at the window and no refusal is recorded.
