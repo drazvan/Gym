@@ -854,3 +854,120 @@ def test_external_commit_marker_rejects_cross_request_acknowledgement() -> None:
             mark_external_staging_committed(rollout_id="rollout-2", model_call_id="c1")
     finally:
         reset_token_sink(token)
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_encoded_prefix_cache_matches_full_records_and_owns_its_bytes(child: bool) -> None:
+    from nemo_gym.token_id_capture.staging.digest import EncodedPrefixDigest
+
+    capture, _ = _capture()
+    call = capture.begin_call(_child() if child else _root())
+    prompt = [10, 11, 12, 13] if child else [10, 11]
+    tokens, logprobs = [21, 22], [-0.0, -0.123456789]
+    record = capture.build_prefix_record(
+        call, prompt_token_ids=prompt, generated_token_ids=tokens, generated_logprobs=logprobs
+    )
+    cache = EncodedPrefixDigest.from_record(
+        record, parent_chain_hash=call.admission.parent_chain_hash, parent_token_ids=call.prefix_token_ids
+    )
+    initial_digest = cache.digest
+    # Later mutation of input/model lists cannot change cached bytes.
+    record.token_ids_delta[-1] = 999
+    record.generation_log_probs_delta[-1] = -1.0
+    for size in (1, 128, 2048, 0):
+        new_tokens, new_logprobs = list(range(30, 30 + size)), [-0.23456789] * size
+        candidate = cache.extend(generated_token_ids=new_tokens, generated_logprobs=new_logprobs)
+        tokens += new_tokens
+        logprobs += new_logprobs
+        expected = capture.build_prefix_record(
+            call, prompt_token_ids=prompt, generated_token_ids=tokens, generated_logprobs=logprobs
+        )
+        assert candidate.digest == expected.digest
+        if not size:
+            assert candidate is cache
+        cache = candidate
+    assert initial_digest != cache.digest
+
+
+def test_encoded_prefix_cache_preserves_restored_masks_and_old_weight_version() -> None:
+    from nemo_gym.token_id_capture.staging.digest import EncodedPrefixDigest
+
+    capture, _ = _capture(weight_version=7)
+    original = capture.build_prefix_record(
+        capture.begin_call(_root()), prompt_token_ids=[10, 11], generated_token_ids=[12], generated_logprobs=[-0.25]
+    )
+    admission = CaptureAdmission(
+        rollout_id="rollout-1-a1",
+        model_call_id="c2",
+        mode="text",
+        generation_cut=GenerationCutContinuation(
+            source_capture_key="rollout-1",
+            source_model_call_id="c1",
+            staging_keys=("old-prefix",),
+            prefix_token_count=1,
+            prefix_digest=original.digest,
+            effective_output_limit=128,
+        ),
+    )
+    resumed, _ = _capture(weight_version=9)
+    call = resumed.begin_call(admission, generation_cut=original, generation_cut_staging_keys=("old-prefix",))
+    base = resumed.build_prefix_record(
+        call, prompt_token_ids=[10, 11, 12], generated_token_ids=[], generated_logprobs=[]
+    )
+    cache = EncodedPrefixDigest.from_record(base, parent_chain_hash=None, parent_token_ids=[])
+    candidate = cache.extend(generated_token_ids=[13, 14], generated_logprobs=[-0.5, -0.75])
+    expected = resumed.build_prefix_record(
+        call, prompt_token_ids=[10, 11, 12], generated_token_ids=[13, 14], generated_logprobs=[-0.5, -0.75]
+    )
+    assert expected.weight_version == 7
+    assert expected.token_mask_delta == [0.0, 0.0, 1.0, 1.0, 1.0]
+    assert candidate.digest == expected.digest
+
+
+@pytest.mark.parametrize(
+    ("tokens", "logprobs"),
+    [
+        ([1], []),
+        ([True], [-0.1]),
+        ([-1], [-0.1]),
+        ([2**64], [-0.1]),
+        ([1], [0]),
+        ([1], [float("nan")]),
+        ([1], [float("inf")]),
+        ([1], [1e39]),
+    ],
+)
+def test_encoded_prefix_cache_rejects_invalid_extension_without_mutating_base(tokens, logprobs) -> None:
+    from nemo_gym.token_id_capture.staging.digest import EncodedPrefixDigest
+
+    capture, _ = _capture()
+    record = capture.build_prefix_record(
+        capture.begin_call(_root()), prompt_token_ids=[10], generated_token_ids=[11], generated_logprobs=[-0.25]
+    )
+    cache = EncodedPrefixDigest.from_record(record, parent_chain_hash=None, parent_token_ids=[])
+    with pytest.raises(ValueError):
+        cache.extend(generated_token_ids=tokens, generated_logprobs=logprobs)
+    assert cache.digest == record.digest
+    assert cache.extend(generated_token_ids=[12], generated_logprobs=[-0.5]).digest != record.digest
+
+
+def test_encoded_prefix_cache_rejects_wrong_parent_or_mutated_record() -> None:
+    from nemo_gym.token_id_capture.staging.digest import EncodedPrefixDigest
+
+    capture, _ = _capture()
+    call = capture.begin_call(_child())
+    record = capture.build_prefix_record(
+        call, prompt_token_ids=[10, 11, 12], generated_token_ids=[13], generated_logprobs=[-0.25]
+    )
+    for parent, chain in [
+        ([10], call.admission.parent_chain_hash),
+        ([10, 11, 99], call.admission.parent_chain_hash),
+        ([10, 11, 12], "f" * 64),
+    ]:
+        with pytest.raises(ValueError, match="prefix cache"):
+            EncodedPrefixDigest.from_record(record, parent_chain_hash=chain, parent_token_ids=parent)
+    record.token_ids_delta[-1] = 999
+    with pytest.raises(ValueError, match="prefix cache"):
+        EncodedPrefixDigest.from_record(
+            record, parent_chain_hash=call.admission.parent_chain_hash, parent_token_ids=call.prefix_token_ids
+        )
