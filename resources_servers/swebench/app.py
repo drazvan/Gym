@@ -13,16 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import logging
 import sys
+from contextlib import asynccontextmanager
 from glob import glob
 from pathlib import Path
 from shutil import rmtree
 from time import monotonic, time
 from traceback import format_exc
-from typing import Any, Dict, Optional, Tuple
+from typing import Annotated, Any, Dict, Optional, Tuple
 
-from fastapi import Request
-from pydantic import BaseModel, Field
+from fastapi import Body, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, Field, ValidationError
 from swebench.harness.run_evaluation import make_test_spec
 from swebench.harness.test_spec.test_spec import LATEST, TestSpec
 
@@ -33,11 +37,17 @@ from nemo_gym.base_resources_server import (
     BaseSeedSessionResponse,
     BaseVerifyRequest,
     BaseVerifyResponse,
+    ResourcesCloseSessionRequest,
+    ResourcesCloseSessionResponse,
+    ResourcesSeedSessionRequest,
+    ResourcesSeedSessionResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.episode_types import EpisodeId, TaskId
 from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.rollout_observability import SandboxObservation
 from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec
+from nemo_gym.sandbox.access import DirectSandboxConnection, SandboxAccess
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.utils import cpu_cap_env
 from nemo_gym.server_utils import SESSION_ID_KEY
@@ -48,6 +58,9 @@ from resources_servers.swebench.swebench_patches import (
     patch_swebench_verified_env_vars,
     run_instance,
 )
+
+
+LOG = logging.getLogger(__name__)
 
 
 class SwebenchResourcesServerConfig(BaseResourcesServerConfig):
@@ -246,6 +259,83 @@ class SwebenchResourcesServer(SimpleResourcesServer):
         super().model_post_init(context)
 
         self._session_id_to_sandbox: Dict[str, AsyncSandbox] = dict()
+        # Typed sessions, which an Environment Server seeds and closes by resources_session_id.
+        self._session_id_to_workdir: Dict[str, str] = dict()
+        self._session_id_to_identity: Dict[str, Tuple[EpisodeId, TaskId]] = dict()
+        self._session_locks: Dict[str, asyncio.Lock] = dict()
+        self._closed_sessions: Dict[str, EpisodeId] = dict()
+
+    def setup_webserver(self) -> FastAPI:
+        app = super().setup_webserver()
+        parent_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI):
+            try:
+                async with parent_lifespan(app) as maybe_state:
+                    yield maybe_state
+            finally:
+                await self.shutdown()
+
+        app.router.lifespan_context = lifespan
+        return app
+
+    async def shutdown(self) -> None:
+        """Stop task sandboxes that no close or verify released, so they do not outlive the server."""
+        self._session_id_to_identity.clear()
+        self._session_locks.clear()
+        self._closed_sessions.clear()
+        for session_id in list(self._session_id_to_sandbox):
+            try:
+                await self._stop_session_sandbox(session_id)
+            except Exception:
+                LOG.exception("Failed to stop abandoned SWE-bench sandbox %s", session_id)
+
+    async def _stop_session_sandbox(self, session_id: str) -> None:
+        sandbox = self._session_id_to_sandbox.get(session_id)
+        if sandbox is not None:
+            # Forget the sandbox only once it stopped, so a failed stop can be retried by a later close.
+            await sandbox.stop()
+            self._session_id_to_sandbox.pop(session_id, None)
+        self._session_id_to_workdir.pop(session_id, None)
+
+    async def close_resources_session(
+        self,
+        request: Request,
+        body: Annotated[Optional[Dict[str, Any]], Body()] = None,
+    ) -> ResourcesCloseSessionResponse | Dict[str, bool]:
+        """Stop the session's task sandbox unless verify already did.
+
+        A typed close is idempotent and fences any later typed seed for the same ``resources_session_id``. An
+        empty body closes the cookie session that an agent's ``/run`` seeded.
+        """
+        if not body:
+            session_id = request.session.get(SESSION_ID_KEY)
+            if session_id is not None:
+                await self._stop_session_sandbox(session_id)
+            return {"closed": True}
+
+        try:
+            typed = ResourcesCloseSessionRequest.model_validate(body)
+        except ValidationError as error:
+            raise RequestValidationError(error.errors()) from error
+        session_id = typed.resources_session_id
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            closed_episode_id = self._closed_sessions.get(session_id)
+            if closed_episode_id is not None:
+                if typed.episode_id != closed_episode_id:
+                    raise ValueError("episode_id does not match the closed resources session")
+                request.session.pop(SESSION_ID_KEY, None)
+                return ResourcesCloseSessionResponse(resources_session_id=session_id)
+            identity = self._session_id_to_identity.get(session_id)
+            if identity is not None and typed.episode_id != identity[0]:
+                raise ValueError("episode_id does not match the seeded resources session")
+            await self._stop_session_sandbox(session_id)
+            self._session_id_to_identity.pop(session_id, None)
+            self._closed_sessions[session_id] = typed.episode_id
+            request.session.pop(SESSION_ID_KEY, None)
+            return ResourcesCloseSessionResponse(resources_session_id=session_id)
 
     async def _create_sandbox(self, test_spec: TestSpec) -> AsyncSandbox:
         # TODO @bxyu-nvidia: Refactor this after Hemil's swap from Python dataclass to Pydantic BaseModel
@@ -298,10 +388,76 @@ class SwebenchResourcesServer(SimpleResourcesServer):
             env_image_tag=LATEST,
         )
 
-    async def seed_session(self, request: Request, body: SWEBenchSeedSessionRequest) -> SWEBenchSeedSessionResponse:
+    async def seed_session(
+        self,
+        request: Request,
+        body: SWEBenchSeedSessionRequest | ResourcesSeedSessionRequest,
+    ) -> SWEBenchSeedSessionResponse | ResourcesSeedSessionResponse:
+        """Create the task sandbox for a legacy instance body or a typed Environment Server seed.
+
+        A typed seed validates ``task_data`` as a SWE-bench instance and returns ``sandbox_access`` with the
+        serialized task sandbox and the image's working directory. Repeating it for the same episode and task
+        returns the same sandbox; seeding again after close is rejected.
+        """
+        if not isinstance(body, ResourcesSeedSessionRequest):
+            eval_sandbox = await self._seed_sandbox(request.session[SESSION_ID_KEY], body)
+            return SWEBenchSeedSessionResponse(sandbox_handle=eval_sandbox._handle.sandbox_id)
+
+        if self.config.num_workers not in (None, 1):
+            raise ValueError("SWE-bench resources sessions are process-local and require num_workers=1")
+        session_id = body.resources_session_id
+        request.session[SESSION_ID_KEY] = session_id
+        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            if session_id in self._closed_sessions:
+                raise ValueError(f"Resources session is already closed: {session_id}")
+            identity = self._session_id_to_identity.get(session_id)
+            if identity is not None:
+                if identity != (body.episode_id, body.task_id):
+                    raise ValueError("resources_session_id is already bound to another episode or task")
+                return await self._typed_seed_response(session_id)
+            task = SWEBenchInstanceRequest.model_validate(body.task_data)
+            if body.task_id.task_id != task.instance_id:
+                raise ValueError("TaskId does not match the SWE-bench instance_id")
+            try:
+                eval_sandbox = await self._seed_sandbox(session_id, task)
+                # The agent works where verify later extracts the patch: the image's WORKDIR.
+                pwd = await eval_sandbox.exec("pwd")
+                workdir = (pwd.stdout or "").strip()
+                if pwd.return_code != 0 or not workdir:
+                    raise RuntimeError(f"Could not resolve the task sandbox workdir: {pwd.stderr}")
+                self._session_id_to_workdir[session_id] = workdir
+                response = await self._typed_seed_response(session_id)
+            except BaseException:
+                # The agent cannot reach a sandbox it was never handed, so stop it here.
+                try:
+                    await self._stop_session_sandbox(session_id)
+                except Exception:
+                    LOG.exception("Failed to stop the SWE-bench sandbox of failed seed %s", session_id)
+                raise
+            self._session_id_to_identity[session_id] = (body.episode_id, body.task_id)
+            return response
+
+    async def _typed_seed_response(self, session_id: str) -> ResourcesSeedSessionResponse:
+        sandbox = self._session_id_to_sandbox.get(session_id)
+        if sandbox is None:
+            raise ValueError(f"SWE-bench task sandbox of {session_id} is no longer available")
+        return ResourcesSeedSessionResponse(
+            resources_session_id=session_id,
+            sandbox_access=SandboxAccess(
+                connection=DirectSandboxConnection(
+                    provider_config_ref=self.config.sandbox_provider,
+                    descriptor=await sandbox.serialize(),
+                ),
+                workdir=self._session_id_to_workdir[session_id],
+            ),
+        )
+
+    async def _seed_sandbox(self, session_id: str, body: SWEBenchInstanceRequest) -> AsyncSandbox:
+        """Create the task sandbox for ``session_id`` and apply the anti-cheating setup."""
         test_spec = self._make_test_spec(body)
         eval_sandbox = await self._create_sandbox(test_spec)
-        self._session_id_to_sandbox[request.session[SESSION_ID_KEY]] = eval_sandbox
+        self._session_id_to_sandbox[session_id] = eval_sandbox
 
         if self.config.apply_anti_cheating:
             # Remove the current Git repo's future history beyond the current commit to prevent the model from cheating.
@@ -318,7 +474,7 @@ Stdout:
 Stderr:
 {result.stderr}""")
 
-        return SWEBenchSeedSessionResponse(sandbox_handle=eval_sandbox._handle.sandbox_id)
+        return eval_sandbox
 
     async def verify(self, request: Request, body: SWEBenchVerifyRequest) -> SWEBenchVerifyResponse:
         """
@@ -342,6 +498,16 @@ Stderr:
         5. Restrict number of turns - same as interleaved thinking, we could add in Responses API model proxy
         """
 
+        session_id = request.session[SESSION_ID_KEY]
+        # A typed session's sandbox is consumed by its first verify. Grading again would score an empty
+        # patch with a normal-looking reward, so a repeated verify fails instead.
+        if (
+            not self.config.is_verifying_golden_patch
+            and session_id in self._session_id_to_identity
+            and session_id not in self._session_id_to_sandbox
+        ):
+            raise ValueError("SWE-bench task sandbox is no longer available")
+
         test_spec = self._make_test_spec(body)
 
         verifier_sandbox_lifecycle_started_at = monotonic()
@@ -363,6 +529,9 @@ Stderr:
                 await original_sandbox.stop()
             except:
                 print("Failed to stop original sandbox", format_exc(), file=sys.stderr)
+                if session_id in self._session_id_to_identity:
+                    # Keep the sandbox so the typed close retries the stop.
+                    self._session_id_to_sandbox[session_id] = original_sandbox
 
         run_id = request.session[SESSION_ID_KEY]
         mock_container = DockerContainer(id=run_id, instance_id=test_spec.instance_id)
