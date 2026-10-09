@@ -1803,7 +1803,7 @@ def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
     scored = {
         k: v
         for k, v in row.items()
-        if not k.startswith("_ng_failure_") and k not in ("failure_kind", "failure_reason")
+        if not k.startswith("_ng_failure_") and k not in ("failure_kind", "failure_reason", "ng_model_call_capture")
     }
     # This metrics-only copy honors the explicit denominator policy. The original
     # answer, failure diagnostics, and training mask remain untouched in the sidecar.
@@ -2796,7 +2796,7 @@ class RolloutCollectionHelper(BaseModel):
 
                 no_persist = bool(result.get(NG_NO_PERSIST_KEY))
                 failure_class = result.get(NG_FAILURE_CLASS_KEY)
-                # No rollout happened, so there is nothing to capture, tokenize or average.
+                # No rollout result, so there is nothing to tokenize or average.
                 no_result = failure_class in _NO_RESULT_FAILURE_CLASSES or bool(result.get(NG_DISPATCH_DRAINED_KEY))
 
                 # Fold this rollout's captured model calls into its record (uniform across agents; no-op
@@ -2807,9 +2807,16 @@ class RolloutCollectionHelper(BaseModel):
                         capture_dirs,
                         include_payloads=not _has_observation_gap(result, "multimodal_history_redacted"),
                     )
+                elif capture_dirs and not result.get(NG_DISPATCH_DRAINED_KEY):
+                    # An agent that raised still made its model calls, and a harness that raises instead of
+                    # returning would otherwise lose them. Keep their metadata, without payloads, on the
+                    # failure record. A drained row never started, so it made none.
+                    merge_model_call_capture_into_record(result, capture_dirs)
 
+                # A failure record keeps its captured calls as they are; only a record that already
+                # carries agent evidence gets a trajectory projected.
                 if (
-                    "ng_model_call_capture" in result
+                    ("ng_model_call_capture" in result and not no_result)
                     or "ng_agent_observations" in result
                     or NG_TRAJECTORY_KEY in result
                 ):
